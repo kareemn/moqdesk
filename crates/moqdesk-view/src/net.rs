@@ -106,6 +106,10 @@ async fn publish_input(track: moq_net::track::Producer, mut rx: UnboundedReceive
 		let ts = moq_net::Timestamp::new(epoch.elapsed().as_micros() as u64, moq_net::Timescale::MICRO)?;
 		g.write_frame(ts, event.encode())?;
 	}
+	if let Some((g, _)) = group {
+		let _ = g.finish();
+	}
+	let _ = track.finish();
 	Ok(())
 }
 

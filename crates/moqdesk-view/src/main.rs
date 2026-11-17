@@ -233,7 +233,11 @@ fn main() -> Result<()> {
 		Some(event_loop) => {
 			let mut app = App::new(shared, input);
 			event_loop.run_app(&mut app)?;
-			app.exit.map_or(Ok(()), |e| Err(anyhow::anyhow!(e)))
+			let exit = app.exit.take();
+			// Dropping the sender finishes the input track; give it a moment to reach the host.
+			drop(app);
+			runtime.block_on(tokio::time::sleep(Duration::from_millis(300)));
+			exit.map_or(Ok(()), |e| Err(anyhow::anyhow!(e)))
 		}
 	}
 }
@@ -456,7 +460,11 @@ impl ApplicationHandler<Wake> for App {
 
 	fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
 		match event {
-			WindowEvent::CloseRequested => event_loop.exit(),
+			WindowEvent::CloseRequested => {
+				// Closing via a shortcut (e.g. Alt+F4) never delivers the modifier's release.
+				self.send(InputEvent::ReleaseAll);
+				event_loop.exit();
+			}
 			WindowEvent::RedrawRequested => {
 				if let Err(err) = self.redraw() {
 					tracing::warn!("render failed: {err:#}");
