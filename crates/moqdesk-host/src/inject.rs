@@ -12,6 +12,9 @@ use x11rb::protocol::xproto::{
 use x11rb::protocol::xtest::ConnectionExt as _;
 use x11rb::rust_connection::RustConnection;
 
+const KEY: (u8, u8) = (KEY_PRESS_EVENT, KEY_RELEASE_EVENT);
+const BUTTON: (u8, u8) = (BUTTON_PRESS_EVENT, BUTTON_RELEASE_EVENT);
+
 pub enum Command {
 	Input { viewer: u64, event: InputEvent },
 	ViewerGone(u64),
@@ -27,6 +30,8 @@ pub struct Injector {
 	conn: RustConnection,
 	root: Window,
 	held: HashMap<u64, Held>,
+	/// How many viewers hold each (press event, code), so one viewer can't release another's key or drag.
+	counts: HashMap<(u8, u8), u32>,
 }
 
 impl Injector {
@@ -40,6 +45,7 @@ impl Injector {
 			conn,
 			root,
 			held: HashMap::new(),
+			counts: HashMap::new(),
 		})
 	}
 
@@ -56,6 +62,24 @@ impl Injector {
 
 	fn fake(&self, kind: u8, detail: u8, x: i16, y: i16) -> Result<()> {
 		self.conn.xtest_fake_input(kind, detail, 0, self.root, x, y, 0)?;
+		Ok(())
+	}
+
+	fn set(&mut self, (press, release): (u8, u8), code: u8, pressed: bool) -> Result<()> {
+		let count = self.counts.entry((press, code)).or_default();
+		let send = if pressed {
+			*count += 1;
+			*count == 1
+		} else {
+			*count = count.saturating_sub(1);
+			*count == 0
+		};
+		if *count == 0 {
+			self.counts.remove(&(press, code));
+		}
+		if send {
+			self.fake(if pressed { press } else { release }, code, 0, 0)?;
+		}
 		Ok(())
 	}
 
@@ -85,16 +109,7 @@ impl Injector {
 				} else {
 					held.remove(&button);
 				}
-				self.fake(
-					if pressed {
-						BUTTON_PRESS_EVENT
-					} else {
-						BUTTON_RELEASE_EVENT
-					},
-					button,
-					0,
-					0,
-				)?;
+				self.set(BUTTON, button, pressed)?;
 			}
 			InputEvent::Scroll { dx, dy } => {
 				for (delta, neg, pos) in [(dy, 4u8, 5u8), (dx, 6, 7)] {
@@ -111,20 +126,20 @@ impl Injector {
 					return Ok(());
 				};
 				let held = &mut self.held.entry(viewer).or_default().keys;
-				if pressed {
-					held.insert(code);
-				} else if !held.remove(&code) {
-					return Ok(());
+				if pressed && !held.insert(code) {
+					// Auto-repeat from a viewer that already holds the key.
+					self.fake(KEY_PRESS_EVENT, code, 0, 0)?;
+				} else if pressed || held.remove(&code) {
+					self.set(KEY, code, pressed)?;
 				}
-				self.fake(if pressed { KEY_PRESS_EVENT } else { KEY_RELEASE_EVENT }, code, 0, 0)?;
 			}
 			InputEvent::ReleaseAll => {
 				if let Some(held) = self.held.remove(&viewer) {
 					for code in held.keys {
-						self.fake(KEY_RELEASE_EVENT, code, 0, 0)?;
+						self.set(KEY, code, false)?;
 					}
 					for button in held.buttons {
-						self.fake(BUTTON_RELEASE_EVENT, button, 0, 0)?;
+						self.set(BUTTON, button, false)?;
 					}
 				}
 			}
