@@ -121,7 +121,7 @@ async fn main() -> Result<()> {
 		let injector = inject::Injector::new(display.as_deref())?;
 		let (tx, rx) = mpsc::channel();
 		spawn_thread("input", move || injector.run(rx));
-		tokio::spawn(watch_viewers(input.consume(), tx, keyframe.clone()));
+		tokio::spawn(watch_viewers(input.consume(), args.name.clone(), tx, keyframe.clone()));
 	}
 
 	let input = (!args.view_only).then_some(input);
@@ -149,7 +149,10 @@ async fn run_direct(
 	publish: &moq_net::origin::Producer,
 	input: Option<moq_net::origin::Producer>,
 ) -> Result<()> {
-	let host = args.public_host.clone().unwrap_or_else(primary_ip);
+	let host = args.public_host.clone().unwrap_or_else(|| match args.listen.ip() {
+		ip if ip.is_unspecified() => primary_ip(),
+		ip => ip.to_string(),
+	});
 	let token = args.token.clone().unwrap_or_else(random_token);
 
 	let mut config = moq_tokio::listen::Config::default();
@@ -174,9 +177,14 @@ async fn run_direct(
 		token: token.clone(),
 		fingerprint,
 	};
-	println!("\nShare this ticket with viewers:\n\n  moqdesk-view {ticket}\n");
+	let name_arg = if args.name == DEFAULT_DESK {
+		String::new()
+	} else {
+		format!(" --name {}", args.name)
+	};
+	println!("\nShare this ticket with viewers:\n\n  moqdesk-view {ticket}{name_arg}\n");
 	if let Some(path) = &args.ticket_file {
-		std::fs::write(path, format!("{ticket}\n")).context("failed to write ticket file")?;
+		write_private(path, &format!("{ticket}\n")).context("failed to write ticket file")?;
 	}
 
 	while let Some(request) = server.accept().await {
@@ -227,13 +235,20 @@ async fn run_relay(
 }
 
 /// Subscribe to the input track of every viewer that announces itself.
-async fn watch_viewers(origin: moq_net::origin::Consumer, tx: mpsc::Sender<Command>, keyframe: Arc<AtomicBool>) {
+async fn watch_viewers(
+	origin: moq_net::origin::Consumer,
+	desk: String,
+	tx: mpsc::Sender<Command>,
+	keyframe: Arc<AtomicBool>,
+) {
+	// Viewers publish under `viewer/<desk>/<id>`, so input meant for another desktop on a shared relay is ignored.
+	let prefix = format!("{VIEWER_PREFIX}/{desk}/");
 	static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 	let active = Arc::new(Mutex::new(HashSet::new()));
 	let mut announced = origin.announced();
 	while let Some(update) = announced.next().await {
 		let path = update.prefix.to_string();
-		if !update.kind.is_active() || !path.starts_with(VIEWER_PREFIX) {
+		if !update.kind.is_active() || !path.starts_with(&prefix) {
 			continue;
 		}
 		if !active.lock().unwrap().insert(path.clone()) {
@@ -264,8 +279,30 @@ async fn read_input(
 		.with_priority(u8::MAX)
 		.with_max_age(Duration::from_secs(2));
 	let mut groups = broadcast.track(INPUT_TRACK)?.subscribe(subscription).await?.ordered();
+	let mut expected = None;
 	while let Some(mut group) = groups.next_group().await? {
-		while let Some(frame) = group.read_frame().await? {
+		// A skipped or truncated group may have held a release; drop this viewer's held state rather than leave keys stuck.
+		let lost = expected.is_some_and(|seq| group.sequence != seq);
+		expected = Some(group.sequence + 1);
+		if lost {
+			tx.send(Command::Input {
+				viewer: id,
+				event: InputEvent::ReleaseAll,
+			})?;
+		}
+		loop {
+			let frame = match group.read_frame().await {
+				Ok(Some(frame)) => frame,
+				Ok(None) => break,
+				Err(err) => {
+					tracing::debug!(%err, "input group ended early");
+					tx.send(Command::Input {
+						viewer: id,
+						event: InputEvent::ReleaseAll,
+					})?;
+					break;
+				}
+			};
 			match InputEvent::decode(&frame.payload) {
 				Ok(InputEvent::RequestKeyframe) => keyframe.store(true, Ordering::Relaxed),
 				Ok(event) => tx.send(Command::Input { viewer: id, event })?,
@@ -274,6 +311,20 @@ async fn read_input(
 		}
 	}
 	Ok(())
+}
+
+/// The ticket is a bearer credential, so keep it readable by the owner only.
+fn write_private(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+	use std::io::Write;
+	use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+	let mut file = std::fs::OpenOptions::new()
+		.write(true)
+		.create(true)
+		.truncate(true)
+		.mode(0o600)
+		.open(path)?;
+	file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+	file.write_all(contents.as_bytes())
 }
 
 fn random_token() -> String {

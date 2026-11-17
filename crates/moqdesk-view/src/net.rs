@@ -28,7 +28,7 @@ pub async fn run(
 	updates: impl Fn(Update) + Send + Sync + 'static,
 ) -> Result<()> {
 	let local = moq_tokio::origin::spawn();
-	let path = format!("{VIEWER_PREFIX}/{}", random_id());
+	let path = format!("{VIEWER_PREFIX}/{}/{}", target.name, random_id());
 	let broadcast = local
 		.create_broadcast(&path)
 		.context("failed to create viewer broadcast")?;
@@ -124,7 +124,8 @@ async fn video(desk: &moq_net::broadcast::Consumer, packets: &mpsc::Sender<Packe
 				}
 			}
 			frame = async { current.as_mut().unwrap().1.read_frame().await }, if current.is_some() => {
-				let Some(frame) = frame? else {
+				// An error means the group expired or was aborted; wait for the next one.
+				let Ok(Some(frame)) = frame.inspect_err(|err| tracing::debug!(%err, "video group ended early")) else {
 					current = None;
 					continue;
 				};
@@ -153,7 +154,7 @@ async fn cursor(desk: &moq_net::broadcast::Consumer, updates: &impl Fn(Update)) 
 				}
 			}
 			frame = async { current.as_mut().unwrap().1.read_frame().await }, if current.is_some() => {
-				let Some(frame) = frame? else {
+				let Ok(Some(frame)) = frame.inspect_err(|err| tracing::debug!(%err, "cursor group ended early")) else {
 					current = None;
 					continue;
 				};

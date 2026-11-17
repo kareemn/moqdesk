@@ -7,7 +7,7 @@ moqdesk-host  ── X11 capture (MIT-SHM) → H.264 (OpenH264) ──▶ MoQ br
      ▲                                                         ├─ catalog.json
      │ XTest                                                    ├─ video   (1 group = 1 GOP)
      │                                                          └─ cursor  (shape + position)
-     └──────────── MoQ broadcast "viewer/<id>" ◀── input ── moqdesk-view (winit + softbuffer)
+     └──────────── MoQ broadcast "viewer/<desk>/<id>" ◀── input ── moqdesk-view (winit + softbuffer)
 ```
 
 ## Why it beats VNC
