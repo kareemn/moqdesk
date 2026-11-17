@@ -236,7 +236,7 @@ fn main() -> Result<()> {
 			let exit = app.exit.take();
 			// Dropping the sender finishes the input track; give it a moment to reach the host.
 			drop(app);
-			runtime.block_on(tokio::time::sleep(Duration::from_millis(300)));
+			runtime.block_on(async { tokio::time::sleep(Duration::from_millis(300)).await });
 			exit.map_or(Ok(()), |e| Err(anyhow::anyhow!(e)))
 		}
 	}
