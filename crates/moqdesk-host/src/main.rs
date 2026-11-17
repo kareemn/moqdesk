@@ -1,0 +1,295 @@
+mod capture;
+mod clock;
+mod cursor;
+mod encode;
+mod inject;
+mod video;
+
+use std::collections::HashSet;
+use std::net::{SocketAddr, UdpSocket};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+use clap::Parser;
+use moqdesk_proto::{CURSOR_TRACK, DEFAULT_DESK, INPUT_TRACK, InputEvent, Ticket, VIDEO_TRACK, VIEWER_PREFIX};
+
+use crate::clock::Clock;
+use crate::inject::Command;
+
+/// Share this X11 desktop over Media over QUIC.
+#[derive(Parser, Debug)]
+#[command(version)]
+struct Args {
+	/// Address for the embedded MoQ server (direct mode).
+	#[arg(long, default_value = "[::]:4443")]
+	listen: SocketAddr,
+
+	/// Publish through a MoQ relay instead of serving directly, e.g. https://relay.example.com/team.
+	#[arg(long)]
+	relay: Option<url::Url>,
+
+	/// Disable TLS verification when connecting to the relay (testing only).
+	#[arg(long, requires = "relay")]
+	relay_insecure: bool,
+
+	/// Broadcast path of this desktop.
+	#[arg(long, default_value = DEFAULT_DESK)]
+	name: String,
+
+	/// X display to capture (defaults to $DISPLAY).
+	#[arg(long)]
+	display: Option<String>,
+
+	/// Maximum frames per second.
+	#[arg(long, default_value_t = 30.0)]
+	fps: f32,
+
+	/// Target video bitrate in bits per second.
+	#[arg(long, default_value_t = 6_000_000)]
+	bitrate: u32,
+
+	/// Seconds between forced keyframes (new MoQ groups).
+	#[arg(long, default_value_t = 5.0)]
+	gop: f32,
+
+	/// Ignore input from viewers.
+	#[arg(long)]
+	view_only: bool,
+
+	/// Access token viewers must present. Randomly generated if omitted.
+	#[arg(long, env = "MOQDESK_TOKEN", hide_env_values = true)]
+	token: Option<String>,
+
+	/// Host name or IP to put in the printed ticket (defaults to the primary local IP).
+	#[arg(long)]
+	public_host: Option<String>,
+
+	/// Also write the ticket to this file.
+	#[arg(long)]
+	ticket_file: Option<PathBuf>,
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+	moq_tokio::Log::new(tracing::Level::INFO).init()?;
+	let args = Args::parse();
+	let display = args.display.clone();
+
+	let clock = Clock::new();
+	let keyframe = Arc::new(AtomicBool::new(false));
+
+	let publish = moq_tokio::origin::spawn();
+	let broadcast = publish
+		.create_broadcast(&args.name)
+		.context("failed to create broadcast")?;
+	broadcast
+		.announce(Default::default())
+		.context("failed to announce broadcast")?;
+
+	let tracks = video::Tracks {
+		catalog: broadcast.create_track(hang::Catalog::DEFAULT_NAME, hang::Catalog::default_track_info())?,
+		video: broadcast.create_track(VIDEO_TRACK, hang::container::track_info(hang::catalog::PRIORITY.video))?,
+	};
+	let cursor_info = moq_net::track::Info::default()
+		.with_timescale(moq_net::Timescale::MICRO)
+		.with_priority(u8::MAX)
+		.with_max_age(Duration::from_secs(1));
+	let cursor_track = broadcast.create_track(CURSOR_TRACK, cursor_info)?;
+
+	let capture = capture::Capture::new(display.as_deref())?;
+	tracing::info!(size = ?capture.size(), "capturing");
+	let settings = video::Settings {
+		fps: args.fps,
+		bitrate: args.bitrate,
+		gop: Duration::from_secs_f32(args.gop),
+		idle_refresh: Duration::from_secs(1),
+	};
+	spawn_thread("video", {
+		let keyframe = keyframe.clone();
+		move || video::run(capture, tracks, settings, keyframe, clock)
+	});
+	spawn_thread("cursor", {
+		let display = display.clone();
+		move || cursor::run(display.as_deref(), cursor_track, clock)
+	});
+
+	let input = moq_tokio::origin::spawn();
+	if !args.view_only {
+		let injector = inject::Injector::new(display.as_deref())?;
+		let (tx, rx) = mpsc::channel();
+		spawn_thread("input", move || injector.run(rx));
+		tokio::spawn(watch_viewers(input.consume(), tx, keyframe.clone()));
+	}
+
+	let input = (!args.view_only).then_some(input);
+	match args.relay.clone() {
+		Some(url) => run_relay(url, args.relay_insecure, &publish, input).await,
+		None => run_direct(&args, &publish, input).await,
+	}
+}
+
+fn spawn_thread(name: &str, f: impl FnOnce() -> Result<()> + Send + 'static) {
+	let name = name.to_string();
+	std::thread::Builder::new()
+		.name(name.clone())
+		.spawn(move || {
+			if let Err(err) = f() {
+				tracing::error!(thread = name, "fatal: {err:#}");
+				std::process::exit(1);
+			}
+		})
+		.expect("failed to spawn thread");
+}
+
+async fn run_direct(
+	args: &Args,
+	publish: &moq_net::origin::Producer,
+	input: Option<moq_net::origin::Producer>,
+) -> Result<()> {
+	let host = args.public_host.clone().unwrap_or_else(primary_ip);
+	let token = args.token.clone().unwrap_or_else(random_token);
+
+	let mut config = moq_tokio::listen::Config::default();
+	config.bind = Some(moq_tokio::listen::Bind::Addr(args.listen));
+	config.tls.generate = vec![host.clone(), "localhost".into()];
+	let mut server = config.init(Default::default())?.listen().await?;
+
+	let port = server.local_addr()?.port();
+	let fingerprint = server
+		.certificates()
+		.fingerprints()
+		.into_iter()
+		.next()
+		.context("no certificate")?;
+	let addr = if host.contains(':') {
+		format!("[{host}]:{port}")
+	} else {
+		format!("{host}:{port}")
+	};
+	let ticket = Ticket {
+		addr,
+		token: token.clone(),
+		fingerprint,
+	};
+	println!("\nShare this ticket with viewers:\n\n  moqdesk-view {ticket}\n");
+	if let Some(path) = &args.ticket_file {
+		std::fs::write(path, format!("{ticket}\n")).context("failed to write ticket file")?;
+	}
+
+	while let Some(request) = server.accept().await {
+		let publish = publish.clone();
+		let input = input.clone();
+		let token = token.clone();
+		tokio::spawn(async move {
+			let path = request.path().trim_matches('/').to_string();
+			if !constant_time_eq(path.as_bytes(), token.as_bytes()) {
+				tracing::warn!("rejected viewer with a bad token");
+				let _ = request.reject(moq_tokio::server::Reject::Unauthorized).await;
+				return;
+			}
+			let mut request = request.with_publisher(&publish);
+			if let Some(input) = input {
+				request = request.with_subscriber(input);
+			}
+			match request.ok().await {
+				Ok(session) => {
+					tracing::info!("viewer connected");
+					let res = session.closed().await;
+					tracing::info!(?res, "viewer disconnected");
+				}
+				Err(err) => tracing::warn!(%err, "handshake failed"),
+			}
+		});
+	}
+	Ok(())
+}
+
+async fn run_relay(
+	url: url::Url,
+	insecure: bool,
+	publish: &moq_net::origin::Producer,
+	input: Option<moq_net::origin::Producer>,
+) -> Result<()> {
+	let mut config = moq_tokio::connect::Config::default();
+	if insecure {
+		config.tls.insecure = Some(true);
+	}
+	let mut client = config.init(Default::default())?.with_publisher(publish);
+	if let Some(input) = input {
+		client = client.with_subscriber(input);
+	}
+	tracing::info!(%url, "publishing via relay");
+	client.connect(url).closed().await?;
+	Ok(())
+}
+
+/// Subscribe to the input track of every viewer that announces itself.
+async fn watch_viewers(origin: moq_net::origin::Consumer, tx: mpsc::Sender<Command>, keyframe: Arc<AtomicBool>) {
+	static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+	let active = Arc::new(Mutex::new(HashSet::new()));
+	let mut announced = origin.announced();
+	while let Some(update) = announced.next().await {
+		let path = update.prefix.to_string();
+		if !update.kind.is_active() || !path.starts_with(VIEWER_PREFIX) {
+			continue;
+		}
+		if !active.lock().unwrap().insert(path.clone()) {
+			continue;
+		}
+		let (origin, tx, keyframe, active) = (origin.clone(), tx.clone(), keyframe.clone(), active.clone());
+		tokio::spawn(async move {
+			let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+			tracing::info!(viewer = %path, "receiving input");
+			if let Err(err) = read_input(&origin, &path, id, &tx, &keyframe).await {
+				tracing::debug!(viewer = %path, %err, "input track ended");
+			}
+			let _ = tx.send(Command::ViewerGone(id));
+			active.lock().unwrap().remove(&path);
+		});
+	}
+}
+
+async fn read_input(
+	origin: &moq_net::origin::Consumer,
+	path: &str,
+	id: u64,
+	tx: &mpsc::Sender<Command>,
+	keyframe: &AtomicBool,
+) -> Result<()> {
+	let broadcast = origin.request_broadcast(path).await?;
+	let subscription = moq_net::track::Subscription::default()
+		.with_priority(u8::MAX)
+		.with_max_age(Duration::from_secs(2));
+	let mut groups = broadcast.track(INPUT_TRACK)?.subscribe(subscription).await?.ordered();
+	while let Some(mut group) = groups.next_group().await? {
+		while let Some(frame) = group.read_frame().await? {
+			match InputEvent::decode(&frame.payload) {
+				Ok(InputEvent::RequestKeyframe) => keyframe.store(true, Ordering::Relaxed),
+				Ok(event) => tx.send(Command::Input { viewer: id, event })?,
+				Err(err) => tracing::warn!(%err, "bad input message"),
+			}
+		}
+	}
+	Ok(())
+}
+
+fn random_token() -> String {
+	let mut bytes = [0u8; 16];
+	getrandom::fill(&mut bytes).expect("no OS randomness");
+	bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+	a.len() == b.len() && a.iter().zip(b).fold(0, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// The source IP the OS would use for outbound traffic. No packets are sent.
+fn primary_ip() -> String {
+	UdpSocket::bind("0.0.0.0:0")
+		.and_then(|s| s.connect("192.0.2.1:9").and(s.local_addr()))
+		.map(|a| a.ip().to_string())
+		.unwrap_or_else(|_| "localhost".into())
+}
