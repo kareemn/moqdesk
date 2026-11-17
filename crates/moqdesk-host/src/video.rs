@@ -15,6 +15,10 @@ use crate::capture::Capture;
 use crate::clock::Clock;
 use crate::encode::{H264Encoder, sps_profile};
 
+// Stay well under moq-net's per-group limits (32 MiB / 8192 frames) by starting a new GOP early.
+const MAX_GROUP_BYTES: usize = 16 << 20;
+const MAX_GROUP_FRAMES: usize = 4096;
+
 pub struct Settings {
 	pub fps: f32,
 	pub bitrate: u32,
@@ -39,6 +43,7 @@ pub fn run(
 	let mut encoder: Option<H264Encoder> = None;
 	let mut group: Option<moq_net::group::Producer> = None;
 	let mut group_start = Instant::now();
+	let (mut group_bytes, mut group_frames) = (0usize, 0usize);
 	let mut last_sent = Instant::now();
 	let mut last_geometry = Instant::now();
 	let mut prev: Vec<u8> = Vec::new();
@@ -60,7 +65,8 @@ pub fn run(
 			}
 		}
 
-		if !tracks.video.is_used() {
+		// Catalog-first players subscribe to the catalog before video, so keep producing for them too.
+		if !tracks.video.is_used() && !tracks.catalog.is_used() {
 			if let Some(g) = group.take() {
 				let _ = g.finish();
 			}
@@ -70,8 +76,21 @@ pub fn run(
 		let force = group.is_none()
 			|| encoder.is_none()
 			|| keyframe.swap(false, Ordering::Relaxed)
-			|| group_start.elapsed() >= settings.gop;
-		let frame = capture.grab()?;
+			|| group_start.elapsed() >= settings.gop
+			|| group_bytes >= MAX_GROUP_BYTES
+			|| group_frames >= MAX_GROUP_FRAMES;
+		let frame = match capture.grab() {
+			Ok(frame) => frame,
+			// The screen can shrink between geometry checks, making the grab rectangle invalid.
+			Err(err) => {
+				if capture.refresh_geometry()? {
+					tracing::info!(size = ?capture.size(), "screen resized");
+					encoder = None;
+					continue;
+				}
+				return Err(err);
+			}
+		};
 		if !force && frame == prev.as_slice() && last_sent.elapsed() < settings.idle_refresh {
 			continue;
 		}
@@ -101,8 +120,11 @@ pub fn run(
 			)?;
 			group = Some(tracks.video.append_group()?);
 			group_start = Instant::now();
+			(group_bytes, group_frames) = (0, 0);
 		}
 		let Some(g) = group.as_mut() else { continue };
+		group_bytes += encoded.data.len();
+		group_frames += 1;
 		hang::container::Frame {
 			timestamp: clock.now(),
 			payload: encoded.data.into(),
