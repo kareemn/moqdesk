@@ -44,13 +44,13 @@ self-signed certificate. Override the advertised address with `--public-host`. U
 ### Through a relay
 
 ```sh
-moq-relay --server-bind '[::]:4443' --tls-generate localhost --auth-public anon   # see moq-relay --help
-moqdesk-host --relay https://relay.example.com/anon --name office
-moqdesk-view --url https://relay.example.com/anon --name office
+moq-relay --listen '[::]:4443' --listen-tls-cert cert.pem --listen-tls-key key.pem --auth-public 'anon/**'
+moqdesk-host --relay https://relay.example.com:4443/anon --name office
+moqdesk-view --url https://relay.example.com:4443/anon --name office
 ```
 
-The host only accepts input from relays when started with input enabled (the default); pass `--view-only` to ignore viewers.
-Relay auth (JWTs) is configured on the relay; put the token in the URL as the relay expects.
+With `--auth-public 'anon/**'` anyone who can reach the relay can watch and send input, so use relay auth (JWTs) for
+anything real, or start the host with `--view-only`. For a self-signed test relay, pass `--relay-insecure` / `--insecure`.
 
 ### Headless mode
 
