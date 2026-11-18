@@ -13,7 +13,12 @@ const POLL: Duration = Duration::from_millis(8);
 /// Start a fresh group periodically so late joiners don't replay a long history.
 const MAX_GROUP_FRAMES: usize = 600;
 
-pub fn run(display: Option<&str>, track: moq_net::track::Producer, clock: Clock) -> Result<()> {
+pub fn run(
+	display: Option<&str>,
+	track: moq_net::track::Producer,
+	clock: Clock,
+	seal: Option<moqdesk_proto::e2e::Sealer>,
+) -> Result<()> {
 	let (conn, _) = x11rb::connect(display).context("failed to connect to the X server")?;
 	conn.xfixes_query_version(5, 0)?
 		.reply()
@@ -44,7 +49,9 @@ pub fn run(display: Option<&str>, track: moq_net::track::Producer, clock: Clock)
 			};
 			pos = (img.x, img.y);
 			if let (Some(update), Some(g)) = (update, group.as_mut()) {
-				g.write_frame(clock.now(), update.encode())?;
+				let payload = update.encode();
+				let payload = seal.as_ref().map_or(payload.clone(), |s| s.seal(&payload));
+				g.write_frame(clock.now(), payload)?;
 				frames += 1;
 			}
 		}

@@ -7,6 +7,9 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+aes-gcm.workspace = true
+base64.workspace = true
+getrandom.workspace = true
 postcard.workspace = true
 serde.workspace = true
 thiserror.workspace = true

@@ -23,13 +23,13 @@ pub struct Settings {
 	pub fps: f32,
 	pub bitrate: u32,
 	pub gop: Duration,
-	/// Re-send unchanged frames at this interval so viewers can measure liveness.
-	pub idle_refresh: Duration,
 }
 
 pub struct Tracks {
 	pub catalog: moq_net::track::Producer,
 	pub video: moq_net::track::Producer,
+	/// Encrypt video frames end to end (the catalog stays readable).
+	pub seal: Option<moqdesk_proto::e2e::Sealer>,
 }
 
 pub fn run(
@@ -44,7 +44,6 @@ pub fn run(
 	let mut group: Option<moq_net::group::Producer> = None;
 	let mut group_start = Instant::now();
 	let (mut group_bytes, mut group_frames) = (0usize, 0usize);
-	let mut last_sent = Instant::now();
 	let mut last_geometry = Instant::now();
 	let mut prev: Vec<u8> = Vec::new();
 	let mut catalog: Option<String> = None;
@@ -91,9 +90,8 @@ pub fn run(
 				return Err(err);
 			}
 		};
-		if !force && frame == prev.as_slice() && last_sent.elapsed() < settings.idle_refresh {
-			continue;
-		}
+		// Unchanged frames are still encoded (as tiny P-frames): players with a jitter buffer stall and
+		// show a spinner when frames stop arriving on a static desktop.
 		prev.clear();
 		prev.extend_from_slice(frame);
 
@@ -125,12 +123,18 @@ pub fn run(
 		let Some(g) = group.as_mut() else { continue };
 		group_bytes += encoded.data.len();
 		group_frames += 1;
-		hang::container::Frame {
+		let frame = hang::container::Frame {
 			timestamp: clock.now(),
 			payload: encoded.data.into(),
+		};
+		match &tracks.seal {
+			Some(seal) => {
+				let mut plain = bytes::BytesMut::new();
+				frame.encode(&mut plain)?;
+				g.write_frame(frame.timestamp, seal.seal(&plain))?;
+			}
+			None => frame.write_to(g)?,
 		}
-		.write_to(g)?;
-		last_sent = Instant::now();
 	}
 }
 

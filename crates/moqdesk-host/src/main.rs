@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use moqdesk_proto::e2e::{Cipher, Sealer};
 use moqdesk_proto::{CURSOR_TRACK, DEFAULT_DESK, INPUT_TRACK, InputEvent, Ticket, VIDEO_TRACK, VIEWER_PREFIX};
 
 use crate::clock::Clock;
@@ -59,6 +60,18 @@ struct Args {
 	#[arg(long)]
 	view_only: bool,
 
+	/// End-to-end encrypt video, cursor and input (default: on when publishing via a relay with input enabled).
+	#[arg(long, overrides_with = "no_e2e")]
+	e2e: bool,
+
+	/// Publish in plaintext through a relay, e.g. for moq.watch. Requires --view-only.
+	#[arg(long, requires = "view_only")]
+	no_e2e: bool,
+
+	/// Base URL of the browser viewer printed in relay links.
+	#[arg(long, default_value = "https://kareemn.github.io/moqdesk/")]
+	web_viewer: url::Url,
+
 	/// Access token viewers must present. Randomly generated if omitted.
 	#[arg(long, env = "MOQDESK_TOKEN", hide_env_values = true)]
 	token: Option<String>,
@@ -89,7 +102,14 @@ async fn main() -> Result<()> {
 		.announce(Default::default())
 		.context("failed to announce broadcast")?;
 
+	let cipher = (args.e2e || (args.relay.is_some() && !args.no_e2e)).then(|| match std::env::var("MOQDESK_KEY") {
+		Ok(key) => Cipher::parse(&key).context("bad MOQDESK_KEY"),
+		Err(_) => Ok(Cipher::generate()),
+	});
+	let cipher = cipher.transpose()?;
+	let seal = |track: &str| cipher.as_ref().map(|c| Sealer::new(c, &args.name, track));
 	let tracks = video::Tracks {
+		seal: seal(VIDEO_TRACK),
 		catalog: broadcast.create_track(hang::Catalog::DEFAULT_NAME, hang::Catalog::default_track_info())?,
 		video: broadcast.create_track(VIDEO_TRACK, hang::container::track_info(hang::catalog::PRIORITY.video))?,
 	};
@@ -105,7 +125,6 @@ async fn main() -> Result<()> {
 		fps: args.fps,
 		bitrate: args.bitrate,
 		gop: Duration::from_secs_f32(args.gop),
-		idle_refresh: Duration::from_secs(1),
 	};
 	spawn_thread("video", {
 		let keyframe = keyframe.clone();
@@ -113,7 +132,10 @@ async fn main() -> Result<()> {
 	});
 	spawn_thread("cursor", {
 		let display = display.clone();
-		move || cursor::run(display.as_deref(), cursor_track, clock)
+		{
+			let seal = seal(CURSOR_TRACK);
+			move || cursor::run(display.as_deref(), cursor_track, clock, seal)
+		}
 	});
 
 	let input = moq_tokio::origin::spawn();
@@ -121,12 +143,21 @@ async fn main() -> Result<()> {
 		let injector = inject::Injector::new(display.as_deref())?;
 		let (tx, rx) = mpsc::channel();
 		spawn_thread("input", move || injector.run(rx));
-		tokio::spawn(watch_viewers(input.consume(), args.name.clone(), tx, keyframe.clone()));
+		tokio::spawn(watch_viewers(
+			input.consume(),
+			args.name.clone(),
+			cipher.clone(),
+			tx,
+			keyframe.clone(),
+		));
 	}
 
 	let input = (!args.view_only).then_some(input);
 	match args.relay.clone() {
-		Some(url) => run_relay(url, args.relay_insecure, &publish, input).await,
+		Some(url) => {
+			print_relay_links(&args, &url, cipher.as_ref());
+			run_relay(url, args.relay_insecure, &publish, input).await
+		}
 		None => run_direct(&args, &publish, input).await,
 	}
 }
@@ -215,6 +246,26 @@ async fn run_direct(
 	Ok(())
 }
 
+fn print_relay_links(args: &Args, relay: &url::Url, cipher: Option<&Cipher>) {
+	let mut params = url::form_urlencoded::Serializer::new(String::new());
+	params
+		.append_pair("relay", relay.as_str())
+		.append_pair("name", &args.name);
+	let mut native = format!("moqdesk-view --url {relay} --name {}", args.name);
+	if let Some(cipher) = cipher {
+		params.append_pair("key", &cipher.encoded_key());
+		native += &format!(" --key {}", cipher.encoded_key());
+	}
+	if args.view_only {
+		params.append_pair("view", "1");
+	}
+	let mut link = args.web_viewer.clone();
+	link.set_fragment(Some(&params.finish()));
+	println!(
+		"\nOpen in a browser (the key after # never leaves the browser):\n\n  {link}\n\nor natively:\n\n  {native}\n"
+	);
+}
+
 async fn run_relay(
 	url: url::Url,
 	insecure: bool,
@@ -238,6 +289,7 @@ async fn run_relay(
 async fn watch_viewers(
 	origin: moq_net::origin::Consumer,
 	desk: String,
+	cipher: Option<Cipher>,
 	tx: mpsc::Sender<Command>,
 	keyframe: Arc<AtomicBool>,
 ) {
@@ -254,11 +306,17 @@ async fn watch_viewers(
 		if !active.lock().unwrap().insert(path.clone()) {
 			continue;
 		}
-		let (origin, tx, keyframe, active) = (origin.clone(), tx.clone(), keyframe.clone(), active.clone());
+		let (origin, tx, keyframe, active, cipher) = (
+			origin.clone(),
+			tx.clone(),
+			keyframe.clone(),
+			active.clone(),
+			cipher.clone(),
+		);
 		tokio::spawn(async move {
 			let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
 			tracing::info!(viewer = %path, "receiving input");
-			if let Err(err) = read_input(&origin, &path, id, &tx, &keyframe).await {
+			if let Err(err) = read_input(&origin, &path, id, cipher.as_ref(), &tx, &keyframe).await {
 				tracing::debug!(viewer = %path, %err, "input track ended");
 			}
 			let _ = tx.send(Command::ViewerGone(id));
@@ -271,6 +329,7 @@ async fn read_input(
 	origin: &moq_net::origin::Consumer,
 	path: &str,
 	id: u64,
+	cipher: Option<&Cipher>,
 	tx: &mpsc::Sender<Command>,
 	keyframe: &AtomicBool,
 ) -> Result<()> {
@@ -280,6 +339,8 @@ async fn read_input(
 		.with_max_age(Duration::from_secs(2));
 	let mut groups = broadcast.track(INPUT_TRACK)?.subscribe(subscription).await?.ordered();
 	let mut expected = None;
+	let aad = moqdesk_proto::e2e::aad(path, INPUT_TRACK);
+	let mut last_counter = None;
 	while let Some(mut group) = groups.next_group().await? {
 		// A skipped or truncated group may have held a release; drop this viewer's held state rather than leave keys stuck.
 		let lost = expected.is_some_and(|seq| group.sequence != seq);
@@ -303,7 +364,24 @@ async fn read_input(
 					break;
 				}
 			};
-			match InputEvent::decode(&frame.payload) {
+			let payload = match cipher {
+				None => frame.payload.to_vec(),
+				Some(cipher) => match moqdesk_proto::e2e::open_input(cipher, &aad, &frame.payload) {
+					Ok((counter, payload)) if last_counter.is_none_or(|last| counter > last) => {
+						last_counter = Some(counter);
+						payload
+					}
+					Ok(_) => {
+						tracing::warn!(viewer = %path, "replayed input frame");
+						continue;
+					}
+					Err(_) => {
+						tracing::warn!(viewer = %path, "input failed authentication (wrong key?)");
+						continue;
+					}
+				},
+			};
+			match InputEvent::decode(&payload) {
 				Ok(InputEvent::RequestKeyframe) => keyframe.store(true, Ordering::Relaxed),
 				Ok(event) => tx.send(Command::Input { viewer: id, event })?,
 				Err(err) => tracing::warn!(%err, "bad input message"),
