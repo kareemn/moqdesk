@@ -158,7 +158,7 @@ async fn main() -> Result<()> {
 			print_relay_links(&args, &url, cipher.as_ref());
 			run_relay(url, args.relay_insecure, &publish, input).await
 		}
-		None => run_direct(&args, &publish, input).await,
+		None => run_direct(&args, &publish, input, cipher.as_ref()).await,
 	}
 }
 
@@ -179,6 +179,7 @@ async fn run_direct(
 	args: &Args,
 	publish: &moq_net::origin::Producer,
 	input: Option<moq_net::origin::Producer>,
+	cipher: Option<&Cipher>,
 ) -> Result<()> {
 	let host = args.public_host.clone().unwrap_or_else(|| match args.listen.ip() {
 		ip if ip.is_unspecified() => primary_ip(),
@@ -211,9 +212,13 @@ async fn run_direct(
 	let name_arg = if args.name == DEFAULT_DESK {
 		String::new()
 	} else {
-		format!(" --name {}", args.name)
+		format!(" --name {}", sh(&args.name))
 	};
-	println!("\nShare this ticket with viewers:\n\n  moqdesk-view {ticket}{name_arg}\n");
+	println!(
+		"\nShare this ticket with viewers:\n\n  {}moqdesk-view {}{name_arg}\n",
+		key_env(cipher),
+		sh(&ticket.to_string())
+	);
 	if let Some(path) = &args.ticket_file {
 		write_private(path, &format!("{ticket}\n")).context("failed to write ticket file")?;
 	}
@@ -251,10 +256,17 @@ fn print_relay_links(args: &Args, relay: &url::Url, cipher: Option<&Cipher>) {
 	params
 		.append_pair("relay", relay.as_str())
 		.append_pair("name", &args.name);
-	let mut native = format!("moqdesk-view --url {relay} --name {}", args.name);
+	let mut native = format!(
+		"{}moqdesk-view --url {} --name {}",
+		key_env(cipher),
+		sh(relay.as_str()),
+		sh(&args.name)
+	);
+	if args.relay_insecure {
+		native += " --insecure";
+	}
 	if let Some(cipher) = cipher {
 		params.append_pair("key", &cipher.encoded_key());
-		native += &format!(" --key {}", cipher.encoded_key());
 	}
 	if args.view_only {
 		params.append_pair("view", "1");
@@ -264,6 +276,21 @@ fn print_relay_links(args: &Args, relay: &url::Url, cipher: Option<&Cipher>) {
 	println!(
 		"\nOpen in a browser (the key after # never leaves the browser):\n\n  {link}\n\nor natively:\n\n  {native}\n"
 	);
+}
+
+/// Passed through the environment so the key stays out of `ps` output.
+fn key_env(cipher: Option<&Cipher>) -> String {
+	cipher.map_or_else(String::new, |c| format!("MOQDESK_KEY={} ", c.encoded_key()))
+}
+
+/// Quote `s` for a POSIX shell when it isn't a plain word.
+fn sh(s: &str) -> String {
+	let plain = |c: char| c.is_ascii_alphanumeric() || "-_./:@%+=,".contains(c);
+	if !s.is_empty() && s.chars().all(plain) {
+		s.to_owned()
+	} else {
+		format!("'{}'", s.replace('\'', r"'\''"))
+	}
 }
 
 async fn run_relay(
