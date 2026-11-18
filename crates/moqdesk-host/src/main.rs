@@ -89,6 +89,11 @@ struct Args {
 async fn main() -> Result<()> {
 	moq_tokio::Log::new(tracing::Level::INFO).init()?;
 	let args = Args::parse();
+	// MoQ normalizes away empty path segments, which would break input scoping and the encryption AAD.
+	anyhow::ensure!(
+		args.name.split('/').all(|segment| !segment.is_empty()),
+		"--name must not be empty or have leading, trailing or repeated '/'"
+	);
 	let display = args.display.clone();
 
 	let clock = Clock::new();
