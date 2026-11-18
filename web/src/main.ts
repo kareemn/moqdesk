@@ -71,8 +71,9 @@ function showForm() {
 		const data = new FormData(form);
 		const link = String(data.get("link") || "").trim();
 		let fragment: string;
-		if (link.includes("#")) fragment = link.slice(link.indexOf("#") + 1);
-		else if (link.startsWith("moqdesk://")) fragment = new URLSearchParams({ ticket: link }).toString();
+		// Check tickets first: they contain a `#` before the certificate fingerprint.
+		if (link.startsWith("moqdesk://")) fragment = new URLSearchParams({ ticket: link }).toString();
+		else if (link.includes("#")) fragment = link.slice(link.indexOf("#") + 1);
 		else {
 			const p = new URLSearchParams();
 			for (const k of ["relay", "name", "key"]) {
@@ -361,6 +362,8 @@ async function run(target: Target) {
 		webtransport: target.fingerprint
 			? { serverCertificateHashes: [{ algorithm: "sha-256", value: target.fingerprint as BufferSource }] }
 			: undefined,
+		// The WebSocket fallback can't pin a certificate, so it must not carry a pinned connection's token.
+		websocket: target.fingerprint ? { enabled: false } : undefined,
 	});
 	setStatus(`waiting for desktop "${target.name}"…`);
 
