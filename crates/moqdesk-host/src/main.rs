@@ -5,7 +5,7 @@ mod encode;
 mod inject;
 mod video;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::{SocketAddr, UdpSocket};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -297,6 +297,8 @@ async fn watch_viewers(
 	let prefix = format!("{VIEWER_PREFIX}/{desk}/");
 	static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 	let active = Arc::new(Mutex::new(HashSet::new()));
+	// Outlives each subscription, so frames from an earlier subscription to the same path can't be replayed.
+	let counters = Arc::new(Mutex::new(HashMap::new()));
 	let mut announced = origin.announced();
 	while let Some(update) = announced.next().await {
 		let path = update.prefix.to_string();
@@ -306,17 +308,18 @@ async fn watch_viewers(
 		if !active.lock().unwrap().insert(path.clone()) {
 			continue;
 		}
-		let (origin, tx, keyframe, active, cipher) = (
+		let (origin, tx, keyframe, active, cipher, counters) = (
 			origin.clone(),
 			tx.clone(),
 			keyframe.clone(),
 			active.clone(),
 			cipher.clone(),
+			counters.clone(),
 		);
 		tokio::spawn(async move {
 			let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
 			tracing::info!(viewer = %path, "receiving input");
-			if let Err(err) = read_input(&origin, &path, id, cipher.as_ref(), &tx, &keyframe).await {
+			if let Err(err) = read_input(&origin, &path, id, cipher.as_ref(), &counters, &tx, &keyframe).await {
 				tracing::debug!(viewer = %path, %err, "input track ended");
 			}
 			let _ = tx.send(Command::ViewerGone(id));
@@ -330,6 +333,7 @@ async fn read_input(
 	path: &str,
 	id: u64,
 	cipher: Option<&Cipher>,
+	counters: &Mutex<HashMap<String, u64>>,
 	tx: &mpsc::Sender<Command>,
 	keyframe: &AtomicBool,
 ) -> Result<()> {
@@ -340,7 +344,7 @@ async fn read_input(
 	let mut groups = broadcast.track(INPUT_TRACK)?.subscribe(subscription).await?.ordered();
 	let mut expected = None;
 	let aad = moqdesk_proto::e2e::aad(path, INPUT_TRACK);
-	let mut last_counter = None;
+	let mut last_counter = counters.lock().unwrap().get(path).copied();
 	while let Some(mut group) = groups.next_group().await? {
 		// A skipped or truncated group may have held a release; drop this viewer's held state rather than leave keys stuck.
 		let lost = expected.is_some_and(|seq| group.sequence != seq);
@@ -369,6 +373,7 @@ async fn read_input(
 				Some(cipher) => match moqdesk_proto::e2e::open_input(cipher, &aad, &frame.payload) {
 					Ok((counter, payload)) if last_counter.is_none_or(|last| counter > last) => {
 						last_counter = Some(counter);
+						counters.lock().unwrap().insert(path.to_owned(), counter);
 						payload
 					}
 					Ok(_) => {
