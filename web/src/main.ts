@@ -69,7 +69,10 @@ function showForm() {
 	form.onsubmit = (e) => {
 		e.preventDefault();
 		const data = new FormData(form);
-		const link = String(data.get("link") || "").trim();
+		// Accept the shell-quoted ticket exactly as moqdesk-host prints it.
+		const link = String(data.get("link") || "")
+			.trim()
+			.replace(/^'(.*)'$/, "$1");
 		let fragment: string;
 		// Check tickets first: they contain a `#` before the certificate fingerprint.
 		if (link.startsWith("moqdesk://")) fragment = new URLSearchParams({ ticket: link }).toString();
