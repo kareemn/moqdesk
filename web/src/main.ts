@@ -70,9 +70,8 @@ function showForm() {
 		e.preventDefault();
 		const data = new FormData(form);
 		// Accept the shell-quoted ticket exactly as moqdesk-host prints it.
-		const link = String(data.get("link") || "")
-			.trim()
-			.replace(/^'(.*)'$/, "$1");
+		let link = String(data.get("link") || "").trim();
+		if (/^'.*'$/.test(link)) link = link.slice(1, -1).replaceAll("'\\''", "'");
 		const fields = (keys: string[], p = new URLSearchParams()) => {
 			for (const k of keys) {
 				const v = String(data.get(k) || "").trim();
