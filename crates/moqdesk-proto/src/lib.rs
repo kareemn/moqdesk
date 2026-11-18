@@ -9,6 +9,7 @@
 //! Each viewer publishes a broadcast under [`VIEWER_PREFIX`] with an [`INPUT_TRACK`]
 //! carrying [`InputEvent`]s that the host replays.
 
+pub mod e2e;
 mod keymap;
 mod ticket;
 

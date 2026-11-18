@@ -45,6 +45,10 @@ struct Args {
 	#[arg(long)]
 	insecure: bool,
 
+	/// End-to-end key printed by moqdesk-host in relay mode.
+	#[arg(long, env = "MOQDESK_KEY", hide_env_values = true)]
+	key: Option<String>,
+
 	/// Don't send any input.
 	#[arg(long)]
 	view_only: bool,
@@ -145,6 +149,7 @@ fn main() -> Result<()> {
 	moq_tokio::Log::new(tracing::Level::INFO).init()?;
 	let args = Args::parse();
 
+	let key = args.key.as_deref().map(moqdesk_proto::e2e::Cipher::parse).transpose()?;
 	let target = match (&args.ticket, &args.url) {
 		(Some(ticket), _) => {
 			let ticket = Ticket::parse(ticket)?;
@@ -153,6 +158,7 @@ fn main() -> Result<()> {
 				name: args.name.clone(),
 				fingerprint: Some(ticket.fingerprint),
 				insecure: args.insecure,
+				key: key.clone(),
 			}
 		}
 		(None, Some(url)) => net::Target {
@@ -160,6 +166,7 @@ fn main() -> Result<()> {
 			name: args.name.clone(),
 			fingerprint: args.fingerprint.clone(),
 			insecure: args.insecure,
+			key: key.clone(),
 		},
 		(None, None) => bail!("pass a ticket from moqdesk-host, or --url for a relay"),
 	};

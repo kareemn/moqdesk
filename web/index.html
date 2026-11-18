@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>moqdesk</title>
+		<link rel="stylesheet" href="./src/style.css" />
+	</head>
+	<body>
+		<header>
+			<strong>moqdesk</strong>
+			<span id="status">idle</span>
+			<span id="stats"></span>
+		</header>
+		<main id="stage">
+			<canvas id="screen" tabindex="0"></canvas>
+			<form id="connect" hidden>
+				<p>
+					Start <code>moqdesk-host --relay https://cdn.moq.dev/anon --name &lt;unique-name&gt;</code> on the machine to
+					share and open the link it prints; it already contains everything below. You can also paste that link, or a
+					<code>moqdesk://</code> ticket from a direct host, here.
+				</p>
+				<label>Link <input name="link" placeholder="https://…/#relay=…&amp;name=…&amp;key=…" /></label>
+				<label>Relay URL <input name="relay" placeholder="https://cdn.moq.dev/anon" /></label>
+				<label>Desktop name <input name="name" value="desk" /></label>
+				<label>Key <input name="key" placeholder="end-to-end key (optional)" /></label>
+				<button type="submit">Connect</button>
+			</form>
+		</main>
+		<script type="module" src="./src/main.ts"></script>
+	</body>
+</html>

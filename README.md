@@ -49,8 +49,31 @@ moqdesk-host --relay https://relay.example.com:4443/anon --name office
 moqdesk-view --url https://relay.example.com:4443/anon --name office
 ```
 
-With `--auth-public 'anon/**'` anyone who can reach the relay can watch and send input, so use relay auth (JWTs) for
-anything real, or start the host with `--view-only`. For a self-signed test relay, pass `--relay-insecure` / `--insecure`.
+With `--auth-public 'anon/**'` anyone who can reach the relay can subscribe and publish, which is why relay mode encrypts
+end to end by default (see below); use relay auth (JWTs) as well for anything real. For a self-signed test relay, pass `--relay-insecure` / `--insecure`.
+
+### In a browser
+
+The [browser viewer](web/) (WebTransport + WebCodecs, Chrome/Edge 97+, Firefox 114+, Safari 26.4+) is a static page; the
+hosted copy is at <https://kareemn.github.io/moqdesk/>. In relay mode the host prints a ready-to-open link:
+
+```sh
+moqdesk-host --relay https://cdn.moq.dev/anon --name office-7f3a
+#   Open in a browser (the key after # never leaves the browser):
+#     https://kareemn.github.io/moqdesk/#relay=https%3A%2F%2Fcdn.moq.dev%2Fanon&name=office-7f3a&key=…
+```
+
+Everything after `#` stays in the browser, so neither the relay nor the page host sees the key. The page can also connect
+straight to a host: paste its `moqdesk://` ticket into the form (the ticket's certificate fingerprint is pinned with
+WebTransport `serverCertificateHashes`).
+
+### End-to-end encryption
+
+When publishing through a relay with input enabled, the host encrypts every video, cursor and input frame with AES-256-GCM
+under a random key (or `MOQDESK_KEY`), binding each frame to its broadcast and track. Input frames also carry a counter so a
+captured frame can't be replayed. The relay only forwards ciphertext and can't watch or inject input. Native viewers take the
+key with `--key`. `--e2e` forces encryption for direct or view-only hosts; `--view-only --no-e2e` publishes plaintext for
+generic players such as `https://moq.watch/anon/<name>?relay=https://cdn.moq.dev`.
 
 ### Headless mode
 
@@ -82,10 +105,10 @@ usages so any viewer platform can map them.
 ```sh
 cargo fmt --all --check && cargo clippy --all-targets -- -D warnings && cargo test
 scripts/e2e.sh   # needs Xvfb, xterm and xdpyinfo
+cd web && npm ci && npm run dev   # browser viewer at http://localhost:5173/#relay=…&name=…&key=…
 ```
 
 ## Roadmap
 
-- Browser viewer (WebTransport + WebCodecs)
 - Wayland (PipeWire portal) and macOS/Windows hosts
 - Hardware encoding (VA-API/NVENC), damage-based encoding, clipboard and audio tracks

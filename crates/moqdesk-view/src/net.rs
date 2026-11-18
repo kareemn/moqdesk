@@ -14,6 +14,8 @@ pub struct Target {
 	pub name: String,
 	pub fingerprint: Option<String>,
 	pub insecure: bool,
+	/// End-to-end key shared by the host (relay mode).
+	pub key: Option<moqdesk_proto::e2e::Cipher>,
 }
 
 pub enum Update {
@@ -38,7 +40,11 @@ pub async fn run(
 		.with_priority(u8::MAX)
 		.with_max_age(Duration::from_secs(2));
 	let input_track = broadcast.create_track(INPUT_TRACK, info)?;
-	tokio::spawn(publish_input(input_track, input));
+	let input_seal = target
+		.key
+		.as_ref()
+		.map(|c| (c.clone(), moqdesk_proto::e2e::aad(&path, INPUT_TRACK)));
+	tokio::spawn(publish_input(input_track, input, input_seal));
 
 	let remote = moq_tokio::origin::spawn();
 	let mut config = moq_tokio::connect::Config::default();
@@ -59,6 +65,12 @@ pub async fn run(
 	let connection = client.connect(target.url);
 
 	let consumer = remote.consume();
+	let seal = |track: &str| {
+		target
+			.key
+			.as_ref()
+			.map(|c| moqdesk_proto::e2e::Sealer::new(c, &target.name, track))
+	};
 	let watch = async {
 		let mut announced = consumer.announced();
 		loop {
@@ -69,8 +81,8 @@ pub async fn run(
 			updates(Update::Status("connected".into()));
 			let desk = consumer.request_broadcast(target.name.as_str()).await?;
 			let res = tokio::select! {
-				res = video(&desk, &packets) => res,
-				res = cursor(&desk, &updates) => res,
+				res = video(&desk, &packets, seal(VIDEO_TRACK)) => res,
+				res = cursor(&desk, &updates, seal(CURSOR_TRACK)) => res,
 			};
 			tracing::info!(?res, "desktop went away");
 			updates(Update::Status("waiting for host".into()));
@@ -88,7 +100,12 @@ fn random_id() -> String {
 	bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-async fn publish_input(track: moq_net::track::Producer, mut rx: UnboundedReceiver<InputEvent>) -> Result<()> {
+async fn publish_input(
+	track: moq_net::track::Producer,
+	mut rx: UnboundedReceiver<InputEvent>,
+	seal: Option<(moqdesk_proto::e2e::Cipher, String)>,
+) -> Result<()> {
+	let mut counter = 0u64;
 	let epoch = Instant::now();
 	let mut group: Option<(moq_net::group::Producer, Instant)> = None;
 	while let Some(event) = rx.recv().await {
@@ -104,7 +121,14 @@ async fn publish_input(track: moq_net::track::Producer, mut rx: UnboundedReceive
 		}
 		let (g, _) = group.as_mut().unwrap();
 		let ts = moq_net::Timestamp::new(epoch.elapsed().as_micros() as u64, moq_net::Timescale::MICRO)?;
-		g.write_frame(ts, event.encode())?;
+		let payload = match &seal {
+			Some((cipher, aad)) => {
+				counter += 1;
+				moqdesk_proto::e2e::seal_input(cipher, aad, counter, &event.encode())
+			}
+			None => event.encode(),
+		};
+		g.write_frame(ts, payload)?;
 	}
 	if let Some((g, _)) = group {
 		let _ = g.finish();
@@ -114,7 +138,11 @@ async fn publish_input(track: moq_net::track::Producer, mut rx: UnboundedReceive
 }
 
 /// Follow the live edge: whenever a newer group (GOP) arrives, abandon the current one.
-async fn video(desk: &moq_net::broadcast::Consumer, packets: &mpsc::Sender<Packet>) -> Result<()> {
+async fn video(
+	desk: &moq_net::broadcast::Consumer,
+	packets: &mpsc::Sender<Packet>,
+	seal: Option<moqdesk_proto::e2e::Sealer>,
+) -> Result<()> {
 	let mut sub = desk.track(VIDEO_TRACK)?.subscribe(None).await?;
 	let mut current: Option<(u64, moq_net::group::Consumer, bool)> = None;
 	loop {
@@ -134,7 +162,17 @@ async fn video(desk: &moq_net::broadcast::Consumer, packets: &mpsc::Sender<Packe
 					continue;
 				};
 				let (seq, _, first) = current.as_mut().unwrap();
-				let frame = hang::container::Frame::decode(frame.payload)?;
+				let payload = match &seal {
+					Some(seal) => match seal.open(&frame.payload) {
+						Ok(plain) => bytes::Bytes::from(plain),
+						Err(err) => {
+							tracing::warn!(%err, "dropping video frame (wrong key?)");
+							continue;
+						}
+					},
+					None => frame.payload,
+				};
+				let frame = hang::container::Frame::decode(payload)?;
 				let packet = Packet { group: *seq, keyframe: std::mem::take(first), data: frame.payload };
 				if packets.send(packet).is_err() {
 					return Ok(());
@@ -144,7 +182,11 @@ async fn video(desk: &moq_net::broadcast::Consumer, packets: &mpsc::Sender<Packe
 	}
 }
 
-async fn cursor(desk: &moq_net::broadcast::Consumer, updates: &impl Fn(Update)) -> Result<()> {
+async fn cursor(
+	desk: &moq_net::broadcast::Consumer,
+	updates: &impl Fn(Update),
+	seal: Option<moqdesk_proto::e2e::Sealer>,
+) -> Result<()> {
 	let mut sub = desk.track(CURSOR_TRACK)?.subscribe(None).await?;
 	let mut current: Option<(u64, moq_net::group::Consumer)> = None;
 	loop {
@@ -162,7 +204,14 @@ async fn cursor(desk: &moq_net::broadcast::Consumer, updates: &impl Fn(Update)) 
 					current = None;
 					continue;
 				};
-				match CursorUpdate::decode(&frame.payload) {
+				let payload = match &seal {
+					Some(seal) => match seal.open(&frame.payload) {
+						Ok(plain) => plain,
+						Err(_) => continue,
+					},
+					None => frame.payload.to_vec(),
+				};
+				match CursorUpdate::decode(&payload) {
 					Ok(update) => {
 						if let CursorUpdate::Shape { width, height, hot_x, hot_y, .. } = &update {
 							tracing::debug!(width, height, hot_x, hot_y, "cursor shape");
