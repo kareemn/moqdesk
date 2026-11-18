@@ -1,0 +1,32 @@
+[workspace]
+resolver = "2"
+members = ["crates/moqdesk-proto", "crates/moqdesk-host", "crates/moqdesk-view"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/kareemn/moqdesk"
+
+[workspace.dependencies]
+moqdesk-proto = { path = "crates/moqdesk-proto" }
+anyhow = "1"
+bytes = "1"
+clap = { version = "4", features = ["derive", "env"] }
+getrandom = "0.3"
+hang = "0.21.24"
+moq-net = "0.3.23"
+moq-tokio = "0.19.37"
+openh264 = "0.9.10"
+postcard = { version = "1", features = ["use-std"] }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+url = "2"
+
+[profile.release]
+debug = 1
+
+[profile.dev.package."*"]
+opt-level = 3

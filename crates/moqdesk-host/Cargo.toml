@@ -1,0 +1,27 @@
+[package]
+name = "moqdesk-host"
+description = "Share an X11 desktop over Media over QUIC"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "moqdesk-host"
+path = "src/main.rs"
+
+[dependencies]
+moqdesk-proto.workspace = true
+anyhow.workspace = true
+bytes.workspace = true
+clap.workspace = true
+getrandom.workspace = true
+hang.workspace = true
+moq-net.workspace = true
+moq-tokio.workspace = true
+openh264.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+url.workspace = true
+libc = "0.2"
+x11rb = { version = "0.14", features = ["shm", "xtest", "xfixes", "randr"] }
