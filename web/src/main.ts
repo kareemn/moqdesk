@@ -73,18 +73,18 @@ function showForm() {
 		const link = String(data.get("link") || "")
 			.trim()
 			.replace(/^'(.*)'$/, "$1");
-		let fragment: string;
-		// Check tickets first: they contain a `#` before the certificate fingerprint.
-		if (link.startsWith("moqdesk://")) fragment = new URLSearchParams({ ticket: link }).toString();
-		else if (link.includes("#")) fragment = link.slice(link.indexOf("#") + 1);
-		else {
-			const p = new URLSearchParams();
-			for (const k of ["relay", "name", "key"]) {
+		const fields = (keys: string[], p = new URLSearchParams()) => {
+			for (const k of keys) {
 				const v = String(data.get(k) || "").trim();
 				if (v) p.set(k, v);
 			}
-			fragment = p.toString();
-		}
+			return p.toString();
+		};
+		let fragment: string;
+		// Check tickets first: they contain a `#` before the certificate fingerprint.
+		if (link.startsWith("moqdesk://")) fragment = fields(["name", "key"], new URLSearchParams({ ticket: link }));
+		else if (link.includes("#")) fragment = link.slice(link.indexOf("#") + 1);
+		else fragment = fields(["relay", "name", "key"]);
 		location.hash = fragment;
 		location.reload();
 	};
