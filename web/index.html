@@ -15,7 +15,11 @@
 		<main id="stage">
 			<canvas id="screen" tabindex="0"></canvas>
 			<form id="connect" hidden>
-				<p>Paste the link printed by <code>moqdesk-host</code>, or fill in the fields.</p>
+				<p>
+					Start <code>moqdesk-host --relay https://cdn.moq.dev/anon --name &lt;unique-name&gt;</code> on the machine to
+					share and open the link it prints; it already contains everything below. You can also paste that link, or a
+					<code>moqdesk://</code> ticket from a direct host, here.
+				</p>
 				<label>Link <input name="link" placeholder="https://…/#relay=…&amp;name=…&amp;key=…" /></label>
 				<label>Relay URL <input name="relay" placeholder="https://cdn.moq.dev/anon" /></label>
 				<label>Desktop name <input name="name" value="desk" /></label>
